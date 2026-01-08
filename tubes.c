@@ -44,17 +44,25 @@ typedef struct _tube {
 
    // On dédinit les exclusions mutuelles pour la lecture et l'écriture
    ExclusionMutuelle lock;
+
+   // On définit les conditions de lecture et d'écriture
+   Condition acces_lecture; // Condition pour qu'un lecteur puisse lire 
+   Condition acces_ecriture; // Condition pour qu'un écrivain puisse écrire
   
 } Tube;
 
 booleen tubeEstVide(Tube * tube)
 {
-   return tube -> taille == 0 && tube->nbEcrivains == 0;
+   // Le tube est vide s'il n'y a pas de données et qu'il reste des écrivains
+   // Donc il peut  avoir d'autres données écrites dans le tube plus tard 
+   return tube -> taille == 0 && tube->nbEcrivains > 0;
 }
 
 booleen tubeEstPlein(Tube * tube)
 {
+   // Le tube est plein s'il n'y a plus de place pour écrire
    return tube -> taille == MANUX_TUBE_CAPACITE;
+}
 
 /**
   * @brief Ouverture d'un tube en tant que Fichier 
@@ -101,6 +109,10 @@ int tubeFermer(Fichier * f)
    }
    if (f->fanions & O_WRONLY) {
       tube->nbEcrivains--;
+      if (tube->nbEcrivains == 0) {
+         // On indique aux lecteurs qu'il n'y aura plus d'écrivains
+         conditionDiffuser(&tube->acces_lecture);
+      }
    }
 
    // On libère l'accés au tube
@@ -121,9 +133,6 @@ size_t tubeEcrire(Fichier * f, void * buffer, size_t nbOctets)
    int nbOctetsEcrits = 0; // Le nombre d'octets déja écrits
 
    printk_debug(DBG_KERNEL_TUBE, "in ecrire\n");
-   
-   // On protège l'accés au tube 
-   exclusionMutuelleEntrer(&tube->lock);
 
    // Peut-on décemment écrire dans le tube ?
    if ((f == NULL) || (f->iNoeud == NULL) || (f->iNoeud->prive == NULL)) {
@@ -131,6 +140,19 @@ size_t tubeEcrire(Fichier * f, void * buffer, size_t nbOctets)
    }
    tube = f->iNoeud->prive;
 
+   // On protège l'accés au tube 
+   exclusionMutuelleEntrer(&tube->lock);
+
+   // On vérifie si il reste des lecteurs dans le tube 
+   if (tube->nbLecteurs > 0) {
+      printk_debug(DBG_KERNEL_TUBE, "Il reste des lecteurs dans le tube\n");
+      while (tubeEstPlein(tube)) {
+         // Le tube est plein, on attend qu'un lecteur lise des données
+         printk_debug(DBG_KERNEL_TUBE, "Le tube est plein, j'attends\n");
+         conditionAttendre(&tube->acces_ecriture, &tube->lock);
+      }
+   }   
+   
    // On fait une boucle, car il est possible que l'on doive écrire en
    // deux fois si on est proche de la fin du tableau qui contient les
    // données.
@@ -155,6 +177,11 @@ size_t tubeEcrire(Fichier * f, void * buffer, size_t nbOctets)
    } while (n > 0);
 
    printk_debug(DBG_KERNEL_TUBE, "out ecrire\n");
+
+   // On indique aux lecteurs qu'il y a des données à lire
+   if (!tubeEstVide(tube)) {
+      conditionSignaler(&tube->acces_lecture);
+   }
 
    // On libère l'accés au tube 
    exclusionMutuelleSortir(&tube->lock);
@@ -181,6 +208,11 @@ size_t tubeLire(Fichier * f, void * buffer, size_t nbOctets)
    // On protège l'accés au tube 
    exclusionMutuelleEntrer(&tube->lock);
 
+   // On vérifie si il y a des données a lire dans le tube
+   while (tubeEstVide(tube)) {
+      conditionAttendre(&tube->acces_lecture, &tube->lock);
+   }
+
    do {
       // A partir de quel octet peut-on lire ?
       indicePremier = (tube->indiceProchain + MANUX_TUBE_CAPACITE - tube->taille)
@@ -206,6 +238,11 @@ size_t tubeLire(Fichier * f, void * buffer, size_t nbOctets)
 
       nbOctetsLus += n;
    } while (n > 0);
+
+   // On indique aux écrivains qu'il y a de la place pour écrire dans le tube
+   if (!tubeEstPlein(tube)) {
+      conditionSignaler(&tube->acces_ecriture);
+   }
 
    printk_debug(DBG_KERNEL_TUBE, "out lire\n");
 
@@ -259,6 +296,10 @@ int sys_tube(ParametreAS as, int * fds)
 
    // Initialisation des exclusions mutuelles 
    exclusionMutuelleInitialiser(&tube->lock);
+
+   // Initialisation des conditions 
+   conditionInitialiser(&tube->acces_lecture);
+   conditionInitialiser(&tube->acces_ecriture);
 
    // Création de l'iNoeud qui décrit le tube dans le système
    iNoeud = iNoeudCreer(tube, &tubeMethodesFichier);
